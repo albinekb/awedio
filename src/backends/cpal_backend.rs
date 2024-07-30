@@ -1,10 +1,13 @@
 //! [`CpalBackend`] outputs audio using the [cpal](https://www.docs.rs/cpal)
 //! crate.
 
-use crate::{manager::BackendSource, manager::Manager, Sound};
+use crate::{
+    manager::{BackendSource, Manager, Renderer},
+    Sound,
+};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    BuildStreamError, PlayStreamError, Sample, StreamError,
+    BackendSpecificError, BuildStreamError, FromSample, PlayStreamError, Sample, StreamError,
 };
 use std::error::Error;
 
@@ -97,40 +100,84 @@ impl CpalBackend {
         let Ok(crate::NextSample::MetadataChanged) = renderer.next_sample() else {
             panic!("expected MetadataChanged event")
         };
-        let channel_count = self.channel_count;
-        let data_callback = move |buffer: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-            assert!(buffer.len() % channel_count as usize == 0);
-            renderer.on_start_of_batch();
-
-            buffer.fill_with(|| {
-                let sample = renderer
-                    .next_sample()
-                    .expect("renderer should never return an Error");
-                match sample {
-                    crate::NextSample::Sample(s) => f32::from_sample(s),
-                    crate::NextSample::MetadataChanged => {
-                        unreachable!("we never change metadata mid-batch")
-                    }
-                    // TODO implement pausing
-                    crate::NextSample::Paused => 0.0,
-                    // TODO implement finishing
-                    crate::NextSample::Finished => 0.0,
-                }
-            });
-        };
 
         let config = cpal::StreamConfig {
             channels: self.channel_count,
             sample_rate: cpal::SampleRate(self.sample_rate),
             buffer_size: self.buffer_size,
         };
-        let timeout = None;
-        let stream =
-            self.device
-                .build_output_stream(&config, data_callback, error_callback, timeout)?;
+        let timeout: Option<std::time::Duration> = None;
+        let device_config = self
+            .device
+            .default_output_config()
+            .map_err(|_| CpalBackendError::NoDevice)?;
+
+        let stream = match device_config.sample_format() {
+            cpal::SampleFormat::I8 => self.device.build_output_stream(
+                &config,
+                make_data_callback::<i8>(renderer, self.channel_count as usize),
+                error_callback,
+                timeout,
+            )?,
+            cpal::SampleFormat::I16 => self.device.build_output_stream(
+                &config,
+                make_data_callback::<i16>(renderer, self.channel_count as usize),
+                error_callback,
+                timeout,
+            )?,
+            cpal::SampleFormat::I32 => self.device.build_output_stream(
+                &config,
+                make_data_callback::<i32>(renderer, self.channel_count as usize),
+                error_callback,
+                timeout,
+            )?,
+            cpal::SampleFormat::F32 => self.device.build_output_stream(
+                &config,
+                make_data_callback::<f32>(renderer, self.channel_count as usize),
+                error_callback,
+                timeout,
+            )?,
+            sample_format => {
+                return Err(CpalBackendError::BuildStream(
+                    BuildStreamError::BackendSpecific {
+                        err: BackendSpecificError {
+                            description: format!("unsupported sample format: {:?}", sample_format),
+                        },
+                    },
+                ))
+            }
+        };
+
         stream.play()?;
         self.stream = Some(stream);
         Ok(manager)
+    }
+}
+
+fn make_data_callback<T>(
+    mut renderer: Renderer,
+    channel_count: usize,
+) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo)
+where
+    T: Sample + FromSample<i16>,
+{
+    move |buffer: &mut [T], _info: &cpal::OutputCallbackInfo| {
+        assert!(buffer.len() % channel_count == 0);
+        renderer.on_start_of_batch();
+
+        buffer.fill_with(|| {
+            let sample = renderer
+                .next_sample()
+                .expect("renderer should never return an Error");
+            match sample {
+                crate::NextSample::Sample(s) => T::from_sample(s),
+                crate::NextSample::MetadataChanged => {
+                    unreachable!("we never change metadata mid-batch")
+                }
+                crate::NextSample::Paused => T::from_sample(0), // TODO: implement pausing
+                crate::NextSample::Finished => T::from_sample(0), // TODO: implement finishing
+            }
+        });
     }
 }
 
