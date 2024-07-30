@@ -4,7 +4,7 @@
 use crate::{manager::BackendSource, manager::Manager, Sound};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    BuildStreamError, PlayStreamError, StreamError,
+    BuildStreamError, PlayStreamError, Sample, StreamError,
 };
 use std::error::Error;
 
@@ -98,7 +98,7 @@ impl CpalBackend {
             panic!("expected MetadataChanged event")
         };
         let channel_count = self.channel_count;
-        let data_callback = move |buffer: &mut [i16], _info: &cpal::OutputCallbackInfo| {
+        let data_callback = move |buffer: &mut [f32], _info: &cpal::OutputCallbackInfo| {
             assert!(buffer.len() % channel_count as usize == 0);
             renderer.on_start_of_batch();
 
@@ -107,14 +107,14 @@ impl CpalBackend {
                     .next_sample()
                     .expect("renderer should never return an Error");
                 match sample {
-                    crate::NextSample::Sample(s) => s,
+                    crate::NextSample::Sample(s) => f32::from_sample(s),
                     crate::NextSample::MetadataChanged => {
                         unreachable!("we never change metadata mid-batch")
                     }
                     // TODO implement pausing
-                    crate::NextSample::Paused => 0,
+                    crate::NextSample::Paused => 0.0,
                     // TODO implement finishing
-                    crate::NextSample::Finished => 0,
+                    crate::NextSample::Finished => 0.0,
                 }
             });
         };
